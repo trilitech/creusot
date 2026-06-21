@@ -16,7 +16,7 @@ use crate::{
     contracts_items::{Intrinsic, get_builtin, is_logic, why3_metas},
     ctx::{BodyId, HasTyCtxt, ItemType},
     naming::name,
-    resolution::TraitResolved,
+    resolution::{TraitResolved, synthesizes_builtin_law},
     translation::{
         constant::try_const_to_term,
         pearlite::{BinOp, Pattern, QuantKind, SmallRenaming, Substable, Term, Trigger, normalize},
@@ -103,6 +103,44 @@ impl<'tcx> Namer<'tcx> for ExpansionProxy<'_, '_, 'tcx> {
     }
 }
 
+/// The element-wise structural postcondition of a builtin tuple `Clone`,
+/// **recursing through nested tuples** so the law composes all the way to leaf
+/// types (e.g. `((a, b), c).clone()` constrains `result.0.0`, not just
+/// `result.0`). At each leaf it emits `<F as Clone>::clone.postcondition((&f,),
+/// result_f)` — the same law `#[derive(Clone)]` produces — built via the
+/// `PostconditionOnce` intrinsic so the leaf law is brought into scope through
+/// the normal intrinsic dependency. `self_val`/`result_val` are by-value terms of
+/// type `ty`. Sound by construction (a conjunction of true per-field clone laws);
+/// a leaf whose own `Clone` is itself unmodeled contributes a vacuous-but-sound
+/// conjunct (see `synthesizes_builtin_law` for the residual-imprecision caveat).
+fn structural_clone_post<'tcx>(
+    ctx: &Why3Generator<'tcx>,
+    typing_env: TypingEnv<'tcx>,
+    clone_fn: DefId,
+    self_val: Term<'tcx>,
+    result_val: Term<'tcx>,
+    ty: Ty<'tcx>,
+) -> Term<'tcx> {
+    if let TyKind::Tuple(field_tys) = ty.kind()
+        && !field_tys.is_empty()
+    {
+        let mut post = Term::true_(ctx.tcx);
+        for (i, field_ty) in field_tys.iter().enumerate() {
+            let sf = self_val.clone().proj(i.into(), field_ty);
+            let rf = result_val.clone().proj(i.into(), field_ty);
+            post = post.conj(structural_clone_post(ctx, typing_env, clone_fn, sf, rf, field_ty));
+        }
+        post
+    } else {
+        let subst = ctx.mk_args(&[GenericArg::from(ty)]);
+        let fndef_ty = Ty::new_fn_def(ctx.tcx, clone_fn, subst);
+        let args = Term::tuple(ctx.tcx, [self_val.shr_ref(ctx.tcx)]);
+        let pps = ctx.mk_args(&[args.ty, fndef_ty].map(GenericArg::from));
+        let post_args = [Term::unit(ctx.tcx).coerce(fndef_ty), args, result_val];
+        Term::call(ctx.tcx, typing_env, Intrinsic::PostconditionOnce.get(ctx), pps, post_args)
+    }
+}
+
 impl<'a, 'ctx, 'tcx> Expander<'a, 'ctx, 'tcx> {
     fn expand_program(&mut self, def_id: DefId, subst: GenericArgsRef<'tcx>) -> Vec<Decl> {
         let dep = Dependency::Item(def_id, subst);
@@ -139,7 +177,7 @@ impl<'a, 'ctx, 'tcx> Expander<'a, 'ctx, 'tcx> {
             pre_sig.contract.requires.clear();
         }
 
-        if let TraitResolved::UnknownFound = TraitResolved::resolve_item(ctx.tcx, typing_env, def_id, subst)
+        if let TraitResolved::UnknownFound | TraitResolved::UnknownBuiltin = TraitResolved::resolve_item(ctx.tcx, typing_env, def_id, subst)
                 // These conditions are important to make sure the Fn trait familly is implemented
                 && ctx.fn_sig(def_id).skip_binder().is_fn_trait_compatible()
                 && ctx.codegen_fn_attrs(def_id).target_features.is_empty()
@@ -170,6 +208,21 @@ impl<'a, 'ctx, 'tcx> Expander<'a, 'ctx, 'tcx> {
                 vec![(Box::new([]), Condition { term: post, expl: expl_post })]
         } else {
             sig_add_type_invariant_spec(ctx, typing_env, names.source_id(), &mut pre_sig, def_id)
+        }
+
+        // Builtin structural `Clone` for tuples: the trait-level `Clone` contract
+        // is empty, so the opaque val would leave the cloned tuple's value
+        // completely unconstrained. Synthesize the element-wise postcondition (see
+        // `structural_clone_post`). `Clone::clone` always has exactly the `&self`
+        // receiver, so `inputs[0]` is the tuple reference.
+        if synthesizes_builtin_law(ctx.tcx, def_id, subst) {
+            let (self_nm, _, self_ty) = pre_sig.inputs[0];
+            let self_val = Term::var(self_nm, self_ty).deref();
+            let result = Term::var(name::result(), pre_sig.output);
+            let post =
+                structural_clone_post(ctx, typing_env, def_id, self_val, result, subst.type_at(0));
+            let expl = format!("expl:{} ensures", ctx.item_name(def_id));
+            pre_sig.contract.ensures.push((Box::new([]), Condition { term: post, expl }));
         }
 
         let sig = lower_program_sig(ctx, &names, name, pre_sig, def_id, name::return_());
@@ -210,6 +263,7 @@ impl<'a, 'ctx, 'tcx> Expander<'a, 'ctx, 'tcx> {
 
         let bound: Box<[Ident]> = pre_sig.inputs.iter().map(|(ident, _, _)| ident.0).collect();
         let trait_resol = TraitResolved::resolve_item(self.tcx(), typing_env, def_id, subst);
+        // No `UnknownBuiltin` arm: a builtin impl is never a logic function.
         assert_matches!(
             trait_resol,
             TraitResolved::NotATraitItem
@@ -345,6 +399,7 @@ impl<'a, 'ctx, 'tcx> Expander<'a, 'ctx, 'tcx> {
         let typing_env = self.typing_env;
         let ctx = self.ctx;
         let trait_resol = TraitResolved::resolve_item(ctx.tcx, typing_env, def_id, subst);
+        // No `UnknownBuiltin` arm: there is no builtin constant.
         assert_matches!(
             trait_resol,
             TraitResolved::NotATraitItem
@@ -721,6 +776,8 @@ fn postcondition_once_term<'tcx>(
                 TraitResolved::NotATraitItem => (),
                 TraitResolved::Instance { def, .. } => (did, subst) = def,
                 TraitResolved::UnknownFound => return None,
+                // Builtin `clone` (tuple/closure) has a spec, so proceed rather than bail.
+                TraitResolved::UnknownBuiltin => (),
                 TraitResolved::NoInstance(..) => unreachable!(),
             }
             post_fndef(ctx, names, did, subst, args, res)
@@ -814,6 +871,8 @@ fn postcondition_mut_term<'tcx>(
                 TraitResolved::NotATraitItem => (),
                 TraitResolved::Instance { def, .. } => (did, subst) = def,
                 TraitResolved::UnknownFound => return None,
+                // Builtin `clone` (tuple/closure) has a spec, so proceed rather than bail.
+                TraitResolved::UnknownBuiltin => (),
                 TraitResolved::NoInstance(..) => unreachable!(),
             }
             post_fndef(ctx, names, did, subst, args, res)
@@ -880,6 +939,8 @@ fn postcondition_term<'tcx>(
                 TraitResolved::NotATraitItem => (),
                 TraitResolved::Instance { def, .. } => (did, subst) = def,
                 TraitResolved::UnknownFound => return None,
+                // Builtin `clone` (tuple/closure) has a spec, so proceed rather than bail.
+                TraitResolved::UnknownBuiltin => (),
                 TraitResolved::NoInstance(..) => unreachable!(),
             }
             post_fndef(ctx, names, did, subst, args, res)
@@ -951,6 +1012,8 @@ fn precondition_term<'tcx>(
                 TraitResolved::NotATraitItem => (),
                 TraitResolved::Instance { def, .. } => (did, subst) = def,
                 TraitResolved::UnknownFound => return None,
+                // Builtin `clone` (tuple/closure) has a spec, so proceed rather than bail.
+                TraitResolved::UnknownBuiltin => (),
                 TraitResolved::NoInstance(..) => unreachable!(),
             }
             pre_fndef(ctx, names, did, subst, args)

@@ -3,8 +3,8 @@ use crate::{
     backend::projections::projections_term,
     contracts_items::Intrinsic,
     ctx::{HasTyCtxt as _, TranslationCtx},
-    lints::{CONTRACTLESS_EXTERNAL_FUNCTION, Diagnostics},
-    resolution::TraitResolved,
+    lints::{CONTRACTLESS_EXTERNAL_FUNCTION, Diagnostics, OPAQUE_BUILTIN_IMPL},
+    resolution::{TraitResolved, synthesizes_builtin_law},
     translation::{
         fmir::{self, *},
         pearlite::{Term, TermKind, UnOp},
@@ -12,6 +12,7 @@ use crate::{
     },
 };
 use itertools::Itertools;
+use rustc_hir::def_id::DefId;
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::{
     mir::{
@@ -19,7 +20,7 @@ use rustc_middle::{
         StatementKind, SwitchTargets,
         TerminatorKind::{self, *},
     },
-    ty::{GenericArgKind, Ty, TyKind, TypingMode},
+    ty::{GenericArg, GenericArgKind, Ty, TyKind, TypingEnv, TypingMode},
 };
 use rustc_span::sym;
 use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
@@ -30,6 +31,35 @@ use std::collections::{HashMap, HashSet};
 // we translate switchInt. We rewrite it into a primitive constructor match
 // rather than switching on discriminant since WhyML doesn't have integer
 // patterns in match expressions.
+
+/// Is the synthesized tuple-`Clone` law (see `elaborator::structural_clone_post`)
+/// *complete* for `ty` — i.e. does every leaf, recursing through nested tuples,
+/// have a `Clone` whose contract actually constrains its result? A leaf whose
+/// `Clone` is itself unmodeled (a closure, or a type with a contractless `Clone`)
+/// only contributes a vacuous conjunct, leaving that part of the result
+/// unconstrained — so the `opaque_builtin_impl` lint must stay live rather than be
+/// suppressed. The empty tuple `()` is vacuously complete (no fields).
+fn clone_law_is_complete<'tcx>(
+    ctx: &TranslationCtx<'tcx>,
+    typing_env: TypingEnv<'tcx>,
+    clone_fn: DefId,
+    ty: Ty<'tcx>,
+) -> bool {
+    if let TyKind::Tuple(fields) = ty.kind() {
+        return fields.iter().all(|f| clone_law_is_complete(ctx, typing_env, clone_fn, f));
+    }
+    let subst = ctx.tcx.mk_args(&[GenericArg::from(ty)]);
+    match TraitResolved::resolve_item(ctx.tcx, typing_env, clone_fn, subst) {
+        // Concrete leaf: complete iff its `Clone` actually carries a postcondition.
+        TraitResolved::Instance { def, .. } => !ctx.sig(def.0).contract.ensures.is_empty(),
+        // Generic-parameter leaf: the conjunct defers to the parameter's own
+        // `Clone` law (`T::clone.postcondition`), faithful — not a precision loss.
+        TraitResolved::NoInstance(_) | TraitResolved::UnknownFound => true,
+        // Unmodeled builtin leaf (a closure — nested tuples took the branch above):
+        // its conjunct is vacuous.
+        TraitResolved::UnknownBuiltin | TraitResolved::NotATraitItem => false,
+    }
+}
 
 impl<'tcx> BodyTranslator<'_, 'tcx> {
     pub fn translate_terminator(&mut self, terminator: &mir::Terminator<'tcx>, loc: Location) {
@@ -98,9 +128,48 @@ impl<'tcx> BodyTranslator<'_, 'tcx> {
                             fun_def_id,
                             subst,
                         );
-                        let known = !matches!(tr_res, TraitResolved::UnknownFound);
+                        let known = !matches!(
+                            tr_res,
+                            TraitResolved::UnknownFound | TraitResolved::UnknownBuiltin
+                        );
+                        // The call resolved to an unmodeled compiler-builtin trait impl
+                        // (`Clone` for a tuple or a closure): it is
+                        // translated abstractly and its result is left unconstrained. Warn so this
+                        // precision loss is not silent. (Generic `T::clone` and `dyn` go
+                        // through other resolution paths and are not flagged here.)
+                        let opaque_builtin = matches!(tr_res, TraitResolved::UnknownBuiltin);
                         let (fun_def_id, subst) =
                             tr_res.to_opt(fun_def_id, subst).expect("could not find instance");
+                        // Suppress the warning only for a builtin call whose synthesized
+                        // law is *complete* — a tuple `Clone` every leaf of which is
+                        // itself modeled. If a leaf is unmodeled (a closure, or a
+                        // contractless `Clone`) its conjunct is vacuous, so the result is
+                        // still partly unconstrained and the lint must stay live.
+                        let fully_modeled =
+                            synthesizes_builtin_law(self.ctx.tcx, fun_def_id, subst)
+                                && clone_law_is_complete(
+                                    self.ctx,
+                                    self.typing_env(),
+                                    fun_def_id,
+                                    subst.type_at(0),
+                                );
+                        if opaque_builtin
+                            && !fully_modeled
+                            && let Some(lint_root) =
+                                self.body.source_info(loc).scope.lint_root(&self.body.source_scopes)
+                        {
+                            let name = self.ctx.tcx.item_name(fun_def_id);
+                            self.ctx.emit_node_span_lint(
+                                OPAQUE_BUILTIN_IMPL,
+                                lint_root,
+                                span,
+                                Diagnostics::OpaqueBuiltinImpl {
+                                    name,
+                                    ty: subst.type_at(0).to_string(),
+                                    span,
+                                },
+                            );
+                        }
                         let sig = self.ctx.sig(fun_def_id);
                         if sig.contract.extern_no_spec
                             && let Some(lint_root) =

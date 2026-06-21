@@ -42,6 +42,38 @@ pub fn select_trait_impl<'tcx>(
     }
 }
 
+/// Does Creusot synthesize a structural specification for this unmodeled
+/// compiler-builtin call, so its result is NOT left unconstrained?
+///
+/// Currently this is tuple `Clone`: the trait-level `Clone` contract is empty,
+/// so the opaque val carries no law; the backend instead synthesizes the
+/// element-wise postcondition, recursing through nested tuples to leaf types
+/// (see `elaborator::structural_clone_post`). When this holds, the
+/// `opaque_builtin_impl` lint is suppressed.
+///
+/// CAVEAT: suppression is per-tuple, but a leaf whose own `Clone` is itself
+/// unmodeled (a closure, or a user type with a contractless `Clone`) still
+/// contributes a vacuous conjunct — so for e.g. `(bool, closure)` the law
+/// constrains the modeled fields but leaves that one leaf unconstrained, a
+/// (now confined, but still silent) precision loss. The common case — tuples of
+/// modeled types at any depth — is fully constrained.
+///
+/// Only tuple `Clone` and closure `Clone` reach the builtin path. Tuple
+/// `PartialEq`/`Ord`/`Hash` and array `Clone` all resolve via real `core` impls
+/// (`ImplSource::UserDefined`) — they never reach this arm, so they neither ICE
+/// nor get a synthesized law here (tuple `==`/`<` already carry a `deep_model`
+/// law from their trait contract; tuple `Hash` is a contractless extern call).
+pub(crate) fn synthesizes_builtin_law<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    subst: GenericArgsRef<'tcx>,
+) -> bool {
+    // The `clone_fn` check short-circuits before `subst.type_at(0)`, which would
+    // panic for items called with an empty substitution.
+    tcx.lang_items().clone_fn() == Some(def_id)
+        && matches!(subst.type_at(0).kind(), TyKind::Tuple(tys) if !tys.is_empty())
+}
+
 fn select_method<'tcx>(
     tcx: TyCtxt<'tcx>,
     typing_env: TypingEnv<'tcx>,
@@ -156,11 +188,18 @@ fn select_method<'tcx>(
                 }
             }
 
-            unimplemented!(
-                "Cannot handle builtin implementation of `{}` for `{}`",
-                tcx.def_path_str(trait_ref.def_id),
-                substs.type_at(0)
-            )
+            // Builtin trait impls we don't model specifically — the
+            // compiler-synthesized impls reaching here are tuple `Clone` and
+            // closure `Clone` (tuple `PartialEq`/`Ord`/`Hash` and array `Clone`
+            // have real `core` impls and resolve via `UserDefined` instead). Rather
+            // than ICE-ing, treat them as an unknown-but-present instance (opaque),
+            // mirroring the `Dynamic` case above. This is sound: an opaque
+            // resolution loses precision (the call is treated abstractly) but never
+            // correctness. `UnknownBuiltin` behaves exactly like `UnknownFound`
+            // downstream, but lets the caller pinpoint that the opacity comes from
+            // an unmodeled builtin impl (used to emit the `opaque_builtin_impl`
+            // lint, so the precision loss is not silent).
+            TraitResolved::UnknownBuiltin
         }
     }
 }
@@ -186,6 +225,18 @@ pub(crate) enum TraitResolved<'tcx> {
     },
     /// A known instance exists, but we don't know which one.
     UnknownFound,
+    /// A known instance exists but is an unmodeled compiler-builtin impl (tuple
+    /// `Clone` or closure `Clone`). Kept as a distinct variant only so the
+    /// translation can emit the `opaque_builtin_impl` lint at the call site (and
+    /// synthesize a law for tuple `Clone`, see `synthesizes_builtin_law`).
+    ///
+    /// Only arises when resolving a *program* function call (`Clone::clone` on a
+    /// tuple/closure). It is therefore unreachable when resolving logic functions,
+    /// constants, or the `Resolve`/`Invariant` traits (none of which have builtin
+    /// impls) — those sites treat it as `unreachable!()`. Where it is reachable, it
+    /// is treated like [`Self::UnknownFound`] (opaque, sound) except at the lint
+    /// emission in `terminator.rs`, the one site that discriminates the two.
+    UnknownBuiltin,
     /// No instance exists, we return extra data to query whether an instance might exist
     /// (via specialization or potentially defined in another crate).
     ///
@@ -236,7 +287,9 @@ impl<'tcx> TraitResolved<'tcx> {
     ) -> Option<(DefId, GenericArgsRef<'tcx>)> {
         match self {
             TraitResolved::Instance { def, impl_: _ } => Some(def),
-            TraitResolved::NotATraitItem | TraitResolved::UnknownFound => Some((did, substs)),
+            TraitResolved::NotATraitItem
+            | TraitResolved::UnknownFound
+            | TraitResolved::UnknownBuiltin => Some((did, substs)),
             _ => None,
         }
     }
